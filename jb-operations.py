@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import re
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -10,6 +11,18 @@ import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill, Alignment, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
+
+LOC_CODE_MAP = {
+    # 文字列でも変換可能にするための対応表
+    "三鷹": "JB01",
+    "Mitaka": "JB01",
+    "中野": "JB07",
+    "Nakano": "JB07",
+    "御茶ノ水": "JB18",
+    "Ochanomizu": "JB18",
+    "千葉": "JB39",
+    "Chiba": "JB39",
+}
 
 
 # -------I/O helpers----------
@@ -20,6 +33,43 @@ def _require_columns(df: pd.DataFrame, required: List[str], sheet: str) -> None:
             f"[{sheet}] 必須列が見つかりません: {missing}\n"
             f"現在の列: {list(df.columns)}"
         )
+
+
+def to_station_code(x):
+    # 文字列駅をナンバリングに変換
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return s
+    if re.fullmatch(r"JB\d{2}", s):
+        return s
+    return LOC_CODE_MAP.get(s, s)
+
+
+# 塗りつぶし色
+FILL_MITAKA = PatternFill("solid", fgColor="1F4E79")  # 紺
+FILL_NAKANO = PatternFill("solid", fgColor="9DC3E6")  # 水色
+FILL_OCHA = PatternFill("solid", fgColor="F4B084")  # オレンジ
+FILL_CHIBA = PatternFill("solid", fgColor="8064A2")  # 紫
+FILL_OTHER = PatternFill("solid", fgColor="FFF2CC")  # 黄色
+
+
+def station_fill(value):
+    # セル値から背景色を決める（4駅=指定色、それ以外=黄色）
+    if value is None:
+        return None
+    code = to_station_code(value)
+    if code == "JB01":
+        return FILL_MITAKA
+    elif code == "JB07":
+        return FILL_NAKANO
+    elif code == "JB18":
+        return FILL_OCHA
+    elif code == "JB39":
+        return FILL_CHIBA
+    else:
+        return FILL_OTHER
 
 
 def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -51,8 +101,9 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     )  # 編成
 
     # IDは文字列に寄せる（Excel側で数字扱いでも安定）
-    ops["operation_id"] = ops["operation_id"].astype(str)
-    forms["formation_id"] = forms["formation_id"].astype(str)
+    ops["start_loc"] = ops["start_loc"].map(to_station_code)
+    ops["end_loc"] = ops["end_loc"].map(to_station_code)
+    forms["init_location"] = forms["init_location"].map(to_station_code)
 
     return ops, forms
 
@@ -191,11 +242,19 @@ def make_baseline_schedule(
     gantt_ops = schedule.pivot(
         index="formation_id", columns="day", values="operation_id"
     )
-    gantt_endloc = schedule.pivot(
-        index="formation_id", columns="day", values="op_end_loc"
-    )
 
-    return schedule, gantt_ops.reset_index(), gantt_endloc.reset_index()
+    # 位置ガント：start/end を別pivotで持つ（Excel側で1日2列にする）
+    gantt_start = schedule.pivot(
+        index="formation_id", columns="day", values="op_start_loc"
+    )
+    gantt_end = schedule.pivot(index="formation_id", columns="day", values="op_end_loc")
+
+    return (
+        schedule,
+        gantt_ops.reset_index(),
+        gantt_start.reset_index(),
+        gantt_end.reset_index(),
+    )
 
 
 # ---------- Excel export ----------
@@ -207,6 +266,7 @@ def add_sheet_from_df(
     df: pd.DataFrame,
     table_name: Optional[str] = None,
     freeze: str = "A2",
+    station_cols: Optional[List[str]] = None,
 ) -> None:
     ws = wb.create_sheet(name)
 
@@ -245,12 +305,94 @@ def add_sheet_from_df(
         tab.tableStyleInfo = style
         ws.add_table(tab)
 
+    # 駅カラムに色付け（指定された列だけ）
+    if station_cols:
+        header = [c.value for c in ws[1]]
+        col_idx = {str(v): i + 1 for i, v in enumerate(header) if v is not None}
+        for col_name in station_cols:
+            if col_name not in col_idx:
+                continue
+            j = col_idx[col_name]
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(r, j)
+                fill = station_fill(cell.value)
+                if fill:
+                    cell.value = to_station_code(cell.value)
+                    cell.fill = fill
 
+
+def add_gantt_loc_sheet(
+    wb: openpyxl.Workbook,
+    name: str,
+    gantt_start: pd.DataFrame,
+    gantt_end: pd.DataFrame,
+) -> None:
+    ws = wb.create_sheet(name)
+    days = list(gantt_start.columns)
+
+    # Row1は2列分書き込む。D01→None→D02→Noneの順
+    ws.cell(1, 1, "formation_id")
+    c = 2
+    for d in days:
+        ws.cell(1, c, d)
+        ws.cell(1, c + 1, None)
+        c += 2
+
+    # Row2はstartとendを交互に書く
+    ws.cell(2, 1, None)
+    c = 2
+    for _ in days:
+        ws.cell(2, c, "start")
+        ws.cell(2, c + 1, "end")
+        c += 2
+
+    # Header style（2段とも）
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(color="FFFFFF", bold=True)
+    for r in (1, 2):
+        for cell in ws[r]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Data rows
+    start_df = gantt_start.copy()
+    end_df = gantt_end.copy()
+    start_df.index = start_df.index.astype(str)
+    end_df.index = end_df.index.astype(str)
+
+    out_r = 3  # 3行目から
+    for fid in start_df.index:
+        ws.cell(out_r, 1, fid)
+        c = 2
+        for d in days:
+            sv = to_station_code(start_df.loc[fid, d])
+            ev = to_station_code(end_df.loc[fid, d])
+            ws.cell(out_r, c, sv)
+            ws.cell(out_r, c + 1, ev)
+
+            # 色付け（start/endとも）
+            for cc, v in [(c, sv), (c + 1, ev)]:
+                fill = station_fill(v)
+                if fill:
+                    ws.cell(out_r, cc).fill = fill
+            c += 2
+        out_r += 1
+
+    # 幅調整とfreeze
+    ws.freeze_panes = "B3"  # ウィンドウ枠の固定
+    ws.column_dimensions["A"].width = 14
+    for col in range(2, ws.max_column + 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 8
+
+
+# Excel出力
 def export_baseline_excel(
     out_path: str,
     schedule: pd.DataFrame,
     gantt_ops: pd.DataFrame,
-    gantt_endloc: pd.DataFrame,
+    gantt_start: pd.DataFrame,
+    gantt_end: pd.DataFrame,
     ops: pd.DataFrame,
     forms: pd.DataFrame,
 ) -> None:
@@ -258,40 +400,32 @@ def export_baseline_excel(
     wb.remove(wb.active)
 
     add_sheet_from_df(
-        wb, "schedule_long", schedule, table_name="ScheduleLong", freeze="A2"
+        wb,
+        "schedule_long",
+        schedule,
+        table_name="ScheduleLong",
+        freeze="A2",
+        station_cols=["op_start_loc", "op_end_loc"],
     )
     add_sheet_from_df(wb, "gantt_ops", gantt_ops, table_name="GanttOps", freeze="B2")
-    add_sheet_from_df(
-        wb, "gantt_endloc", gantt_endloc, table_name="GanttEndLoc", freeze="B2"
-    )
 
-    add_sheet_from_df(wb, "master_operations", ops, table_name="MasterOps", freeze="A2")
+    add_gantt_loc_sheet(wb, "gantt_loc", gantt_start, gantt_end)
     add_sheet_from_df(
-        wb, "master_formations", forms, table_name="MasterForms", freeze="A2"
+        wb,
+        "master_operations",
+        ops,
+        table_name="MasterOps",
+        freeze="A2",
+        station_cols=["start_loc", "end_loc"],
     )
-
-    ws = wb.create_sheet("README")
-    ws["A1"] = "baseline_output.xlsx について"
-    ws["A1"].font = Font(bold=True, size=14)
-    lines = [
-        "これは『制約・最適化なし』で、master_data.xlsx から 30日分の割当表を出すためのベースライン出力です。",
-        "",
-        "sheet: schedule_long",
-        "  - 1行=1編成×1日。RUN=運用、IDLE=予備待機。",
-        "  - deadhead=1 の場合、開始位置が合わず『回送で辻褄合わせた』扱い（今回は制約をかけないため許容）。",
-        "",
-        "sheet: gantt_ops",
-        "  - 編成×日 の行列（ガント風）で operation_id だけを並べています。",
-        "",
-        "sheet: gantt_endloc",
-        "  - 編成×日 の行列で、その日の終了位置 (op_end_loc) を並べています。",
-        "",
-        "次のステップでは、このベースラインに対して制約（位置整合・固定翌日運用・検査A/B等）を順に追加します。",
-    ]
-    for i, t in enumerate(lines, start=3):
-        ws[f"A{i}"] = t
-        ws[f"A{i}"].alignment = Alignment(wrap_text=True)
-    ws.column_dimensions["A"].width = 110
+    add_sheet_from_df(
+        wb,
+        "master_formations",
+        forms,
+        table_name="MasterForms",
+        freeze="A2",
+        station_cols=["init_location"],
+    )
 
     wb.save(out_path)
 
@@ -301,8 +435,12 @@ def export_baseline_excel(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--master", default="data/master_data.xlsx", help="master_data.xlsx のパス")
-    ap.add_argument("--out", default="outputs/baseline_output.xlsx", help="出力Excelパス")
+    ap.add_argument(
+        "--master", default="data/master_data.xlsx", help="master_data.xlsx のパス"
+    )
+    ap.add_argument(
+        "--out", default="outputs/baseline_output.xlsx", help="出力Excelパス"
+    )
     ap.add_argument("--days", type=int, default=30, help="何日分作るか")
     ap.add_argument(
         "--start-date",
@@ -318,14 +456,14 @@ def main() -> None:
     args = ap.parse_args()
 
     ops, forms = read_master(args.master)
-    schedule, gantt_ops, gantt_endloc = make_baseline_schedule(
+    schedule, gantt_ops, gantt_start, gantt_end = make_baseline_schedule(
         ops,
         forms,
         days=args.days,
         start_date=args.start_date,
         default_idle_op=args.default_idle_op,
     )
-    export_baseline_excel(args.out, schedule, gantt_ops, gantt_endloc, ops, forms)
+    export_baseline_excel(args.out, schedule, gantt_ops, gantt_start, gantt_end, ops, forms)
     print(f"OK: {args.out}")
     print(f"schedule_long: {schedule.shape[0]} rows, {schedule.shape[1]} cols")
 
