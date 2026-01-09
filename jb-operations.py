@@ -1,11 +1,10 @@
 from __future__ import annotations
-
 import argparse
 import datetime as dt
 import re
+import random
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
-
 import pandas as pd
 import openpyxl
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -53,6 +52,7 @@ FILL_NAKANO = PatternFill("solid", fgColor="9DC3E6")  # 水色
 FILL_OCHA = PatternFill("solid", fgColor="F4B084")  # オレンジ
 FILL_CHIBA = PatternFill("solid", fgColor="8064A2")  # 紫
 FILL_OTHER = PatternFill("solid", fgColor="FFF2CC")  # 黄色
+FONT_WHITE = Font(color="FFFFFF")
 
 
 def station_fill(value):
@@ -70,6 +70,12 @@ def station_fill(value):
         return FILL_CHIBA
     else:
         return FILL_OTHER
+
+
+def set_white_font(cell, value):
+    """三鷹(JB01)だけ文字を白にする"""
+    if to_station_code(value) == "JB01":
+        cell.font = FONT_WHITE
 
 
 def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -124,6 +130,9 @@ def make_baseline_schedule(
     days: int = 30,
     start_date: Optional[str] = None,
     default_idle_op: str = "IDOL_Mitaka",
+    seed: int = 30,
+    tsudanuma_code: str = "JB33",
+    priority_start_codes: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     制約なしの割当：
@@ -134,6 +143,8 @@ def make_baseline_schedule(
     """
 
     required_ops = ops[ops["required"] == 1].copy().reset_index(drop=True)
+    if priority_start_codes is None:
+        priority_start_codes = ["JB01", "JB07", "JB18", "JB39"]  # 津田沼以外の優先駅
 
     # 予備待機（required=0 かつ 検査Bじゃないもの）から start_loc→operation_id を作る
     idle_ops = ops[(ops["required"] == 0) & (ops["is_inspection_B"] == 0)].copy()
@@ -166,73 +177,120 @@ def make_baseline_schedule(
 
     for di in range(days):
         day = day_labels[di]
-        available = formation_ids.copy()
+        available = formation_ids.copy()  # 使える編成
+        rng = random.Random(seed + di)  # 日ごとに乱数固定
 
-        # required運用を順に割当
-        for op in required_ops.itertuples(index=False):
-            op_id = str(op.operation_id)
-            start_loc = op.start_loc
+        # required運用の未割当リスト（その日ごとに消し込む）
+        req_today = required_ops.copy()
 
-            # start_loc にいる編成を探す
-            pick = None
-            for fid in available:
-                if state[fid].loc == start_loc:
-                    pick = fid
-                    break
-
-            deadhead = False
-            if pick is None:
-                # いなければ適当（制約なしなので許容）
-                pick = available[0]
-                deadhead = True
-
-            available.remove(pick)
+        def assign_one(formation_id: str, op_row) -> None:
+            """1編成に1運用を割当して、rows追加・state更新・availableから除外・req_todayから除外"""
+            nonlocal req_today  # 関数外の変数を更新するためnonlocalをつける
+            op_id = str(op_row.operation_id)
+            deadhead = int(
+                state[formation_id].loc != op_row.start_loc
+            )  # 回送して辻褄合わせした場合
 
             rows.append(
                 dict(
                     day=day,
-                    formation_id=pick,
+                    formation_id=formation_id,
                     operation_id=op_id,
                     status="RUN",
-                    op_start_loc=op.start_loc,
-                    op_end_loc=op.end_loc,
-                    deadhead=int(deadhead),
-                    daysA_before=state[pick].daysA,
-                    daysB_before=state[pick].daysB,
+                    op_start_loc=op_row.start_loc,
+                    op_end_loc=op_row.end_loc,
+                    deadhead=deadhead,
+                    daysA_before=state[formation_id].daysA,
+                    daysB_before=state[formation_id].daysB,
                 )
             )
 
-            # 終点へ移動
-            state[pick].loc = op.end_loc
+            # 状態更新
+            state[formation_id].loc = op_row.end_loc
+            if formation_id in available:
+                available.remove(formation_id)
+            # req_todayからop_idを一件だけ消す
+            req_today = req_today[req_today["operation_id"] != op_id].reset_index(
+                drop=True
+            )
+
+        # 1) 優先駅（JB01/JB07/JB18/JB39）にいる車両は「その駅始発」の運用へ
+        for code in priority_start_codes:
+            # その駅にいる編成
+            formation_ids_here = [
+                formation_id
+                for formation_id in available
+                if state[formation_id].loc == code
+            ]
+            if not formation_ids_here:
+                continue
+
+            # その駅始発のrequired運用
+            ops_here = req_today[req_today["start_loc"] == code].copy()
+            if ops_here.empty:
+                continue
+
+            # ある分だけ割り当て（順序は formation_id の昇順で安定化）
+            formation_ids_here.sort()
+            for formation_id, op_row in zip(
+                formation_ids_here, ops_here.itertuples(index=False)
+            ):
+                assign_one(formation_id, op_row)
+
+        # 2) 津田沼（tsudanuma_code）にいる車両は「残りrequired」からランダム割当
+        formation_ids_tsudanuma = [
+            formation_id
+            for formation_id in available
+            if state[formation_id].loc == tsudanuma_code
+        ]
+        if formation_ids_tsudanuma and len(req_today) > 0:
+            formation_ids_tsudanuma.sort()
+            remaining_ops = list(req_today.itertuples(index=False))
+            rng.shuffle(remaining_ops)
+            for formation_id, op_row in zip(formation_ids_tsudanuma, remaining_ops):
+                assign_one(formation_id, op_row)
+
+        # 3) 残りの required は従来通り：位置一致優先、ダメなら deadhead 許容
+        for op_row in list(req_today.itertuples(index=False)):
+            # start_loc一致の編成を探す
+            pick = None
+            for formation_id in available:
+                if state[formation_id].loc == op_row.start_loc:
+                    pick = formation_id
+                    break
+            if pick is None:
+                # いなければ適当（ここはまだ制約緩い段階なので許容）
+                pick = available[0]
+            assign_one(pick, op_row)
 
         # 余り編成は待機運用へ
-        for fid in available:
-            loc = state[fid].loc
+        for formation_id in available:
+            loc = state[formation_id].loc
             idle_op = idle_by_start.get(loc, default_idle_op)
             idle_row = op_by_id.get(idle_op, None)
 
             rows.append(
                 dict(
                     day=day,
-                    formation_id=fid,
+                    formation_id=formation_id,
                     operation_id=idle_op,
                     status="IDLE",
                     op_start_loc=(idle_row.start_loc if idle_row else loc),
                     op_end_loc=(idle_row.end_loc if idle_row else loc),
                     deadhead=0,
-                    daysA_before=state[fid].daysA,
-                    daysB_before=state[fid].daysB,
+                    daysA_before=state[formation_id].daysA,
+                    daysB_before=state[formation_id].daysB,
                 )
             )
 
             # 待機運用にも end_loc があれば反映
             if idle_row:
-                state[fid].loc = idle_row.end_loc
+                state[formation_id].loc = idle_row.end_loc
 
         # 日数カウンタ更新（制約なしでも出力に入れておくと後で便利）
-        for fid in formation_ids:
-            state[fid].daysA += 1
-            state[fid].daysB += 1
+        for formation_id in formation_ids:
+            state[formation_id].daysA += 1
+            state[formation_id].daysB += 1
 
     schedule = (
         pd.DataFrame(rows).sort_values(["day", "formation_id"]).reset_index(drop=True)
@@ -319,6 +377,7 @@ def add_sheet_from_df(
                 if fill:
                     cell.value = to_station_code(cell.value)
                     cell.fill = fill
+                    set_white_font(cell, cell.value)
 
 
 def add_gantt_loc_sheet(
@@ -362,12 +421,12 @@ def add_gantt_loc_sheet(
     end_df.index = end_df.index.astype(str)
 
     out_r = 3  # 3行目から
-    for fid in start_df.index:
-        ws.cell(out_r, 1, fid)
+    for formation_id in start_df.index:
+        ws.cell(out_r, 1, formation_id)
         c = 2
         for d in days:
-            sv = to_station_code(start_df.loc[fid, d])
-            ev = to_station_code(end_df.loc[fid, d])
+            sv = to_station_code(start_df.loc[formation_id, d])
+            ev = to_station_code(end_df.loc[formation_id, d])
             ws.cell(out_r, c, sv)
             ws.cell(out_r, c + 1, ev)
 
@@ -375,7 +434,9 @@ def add_gantt_loc_sheet(
             for cc, v in [(c, sv), (c + 1, ev)]:
                 fill = station_fill(v)
                 if fill:
-                    ws.cell(out_r, cc).fill = fill
+                    cell = ws.cell(out_r, cc)
+                    cell.fill = fill
+                    set_white_font(cell, v)
             c += 2
         out_r += 1
 
@@ -452,6 +513,14 @@ def main() -> None:
         default="IDOL_Mitaka",
         help="待機運用が引けない時のデフォルト operation_id",
     )
+    ap.add_argument(
+        "--seed", type=int, default=42, help="津田沼ランダム割当の乱数seed（再現性用）"
+    )
+    ap.add_argument(
+        "--tsudanuma-code",
+        default="JB33",
+        help="津田沼の駅コード（master_dataに合わせる）",
+    )
 
     args = ap.parse_args()
 
@@ -462,8 +531,12 @@ def main() -> None:
         days=args.days,
         start_date=args.start_date,
         default_idle_op=args.default_idle_op,
+        seed=args.seed,
+        tsudanuma_code=args.tsudanuma_code,
     )
-    export_baseline_excel(args.out, schedule, gantt_ops, gantt_start, gantt_end, ops, forms)
+    export_baseline_excel(
+        args.out, schedule, gantt_ops, gantt_start, gantt_end, ops, forms
+    )
     print(f"OK: {args.out}")
     print(f"schedule_long: {schedule.shape[0]} rows, {schedule.shape[1]} cols")
 
