@@ -50,7 +50,7 @@ def to_station_code(x):
 FILL_MITAKA = PatternFill("solid", fgColor="1F4E79")  # 紺
 FILL_NAKANO = PatternFill("solid", fgColor="9DC3E6")  # 水色
 FILL_OCHA = PatternFill("solid", fgColor="F4B084")  # オレンジ
-FILL_CHIBA = PatternFill("solid", fgColor="8064A2")  # 紫
+FILL_CHIBA = PatternFill("solid", fgColor="da70d6")  # 紫
 FILL_OTHER = PatternFill("solid", fgColor="FFF2CC")  # 黄色
 FONT_WHITE = Font(color="FFFFFF")
 
@@ -310,8 +310,8 @@ def make_baseline_schedule(
     return (
         schedule,
         gantt_ops.reset_index(),
-        gantt_start.reset_index(),
-        gantt_end.reset_index(),
+        gantt_start,
+        gantt_end,
     )
 
 
@@ -349,19 +349,8 @@ def add_sheet_from_df(
         ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 40)
 
     ws.freeze_panes = freeze
+    # フィルターだけ付ける
     ws.auto_filter.ref = ws.dimensions
-
-    if table_name:
-        tab = Table(displayName=table_name, ref=ws.dimensions)
-        style = TableStyleInfo(
-            name="TableStyleMedium9",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        tab.tableStyleInfo = style
-        ws.add_table(tab)
 
     # 駅カラムに色付け（指定された列だけ）
     if station_cols:
@@ -469,7 +458,6 @@ def export_baseline_excel(
         station_cols=["op_start_loc", "op_end_loc"],
     )
     add_sheet_from_df(wb, "gantt_ops", gantt_ops, table_name="GanttOps", freeze="B2")
-
     add_gantt_loc_sheet(wb, "gantt_loc", gantt_start, gantt_end)
     add_sheet_from_df(
         wb,
