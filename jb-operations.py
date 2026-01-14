@@ -47,7 +47,7 @@ def to_station_code(x):
 
 
 # 塗りつぶし色
-FILL_MITAKA = PatternFill("solid", fgColor="1F4E79")  # 紺
+FILL_MITAKA = PatternFill("solid", fgColor="4F82EA")  # 紺
 FILL_NAKANO = PatternFill("solid", fgColor="9DC3E6")  # 水色
 FILL_OCHA = PatternFill("solid", fgColor="F4B084")  # オレンジ
 FILL_CHIBA = PatternFill("solid", fgColor="da70d6")  # 紫
