@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
 import pandas as pd
 import openpyxl
+from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill, Alignment, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -433,7 +434,93 @@ def add_gantt_loc_sheet(
     ws.freeze_panes = "B3"  # ウィンドウ枠の固定
     ws.column_dimensions["A"].width = 14
     for col in range(2, ws.max_column + 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 8
+        ws.column_dimensions[get_column_letter(col)].width = 8
+
+
+def add_formation_triplet_sheet(
+    wb: openpyxl.Workbook,
+    name: str,
+    schedule: pd.DataFrame,
+    days: list[str],
+    formations: list[str],
+) -> None:
+    ws = wb.create_sheet(name)
+
+    # Row1: 編成ヘッダ（3列結合）
+    ws.cell(1, 1, None)
+    col = 2
+    for formation_id in formations:
+        ws.cell(1, col, formation_id)
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
+        col += 3
+
+    # Row2: start/end/operation
+    ws.cell(2, 1, None)
+    col = 2
+    for _ in formations:
+        ws.cell(2, col, "start")
+        ws.cell(2, col + 1, "end")
+        ws.cell(2, col + 2, "operation")
+        col += 3
+
+    # ヘッダスタイル（2段）
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(color="FFFFFF", bold=True)
+    for r in (1, 2):
+        for cell in ws[r]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 参照しやすいように pivot
+    schedule_copy = schedule.copy()
+    schedule_copy["day"] = schedule_copy["day"].astype(str)
+    schedule_copy["formation_id"] = schedule_copy["formation_id"].astype(str)
+
+    p_start = schedule_copy.pivot(
+        index="day", columns="formation_id", values="op_start_loc"
+    ).reindex(index=days, columns=formations)
+    p_end = schedule_copy.pivot(
+        index="day", columns="formation_id", values="op_end_loc"
+    ).reindex(index=days, columns=formations)
+    p_op = schedule_copy.pivot(
+        index="day", columns="formation_id", values="operation_id"
+    ).reindex(index=days, columns=formations)
+
+    # Data rows
+    out_r = 3  # 3行目から
+    for day in days:
+        ws.cell(out_r, 1, day)
+        ws.cell(out_r, 1).alignment = Alignment(horizontal="center", vertical="center")
+
+        col = 2
+        for formation_id in formations:
+            sv = to_station_code(p_start.loc[day, formation_id])
+            ev = to_station_code(p_end.loc[day, formation_id])
+            ov = p_op.loc[day, formation_id]
+
+            c_start = ws.cell(out_r, col, sv)
+            c_end = ws.cell(out_r, col + 1, ev)
+            c_op = ws.cell(out_r, col + 2, (None if pd.isna(ov) else str(ov)))
+
+            # start/end は駅色を塗る（既存ルールに合わせる）
+            for cell, v in [(c_start, sv), (c_end, ev)]:
+                fill = station_fill(v)
+                if fill:
+                    cell.fill = fill
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            # operation は中央寄せ
+            c_op.alignment = Alignment(horizontal="center", vertical="center")
+
+            col += 3
+        out_r += 1
+
+    # 罫線っぽく見せる（列幅と固定）
+    ws.freeze_panes = "B3"
+    ws.column_dimensions["A"].width = 8
+    for col in range(2, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 10
 
 
 # Excel出力
@@ -459,6 +546,10 @@ def export_baseline_excel(
     )
     add_sheet_from_df(wb, "gantt_ops", gantt_ops, table_name="GanttOps", freeze="B2")
     add_gantt_loc_sheet(wb, "gantt_loc", gantt_start, gantt_end)
+    # day/formation の順序をここで固定
+    days = sorted(schedule["day"].astype(str).unique(), key=lambda s: (len(s), s))
+    formations = sorted(schedule["formation_id"].astype(str).unique())
+    add_formation_triplet_sheet(wb, "gantt_triplet", schedule, days, formations)
     add_sheet_from_df(
         wb,
         "master_operations",
