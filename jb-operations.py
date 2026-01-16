@@ -9,7 +9,7 @@ import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import PatternFill, Alignment, Font
+from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 LOC_CODE_MAP = {
@@ -515,6 +515,51 @@ def add_formation_triplet_sheet(
 
             col += 3
         out_r += 1
+
+    # --- 3列セット（start/end/op）の境界を太線にする（各ブロック最終列の右側） ---
+    THICK = Side(style="thick", color="000000")
+    row_max = ws.max_row
+    start_col = 2
+    cols_per = 3
+    for i in range(len(formations)):
+        boundary_col = start_col + cols_per * (i + 1) - 1
+        for r in range(1, row_max + 1):
+            cell = ws.cell(r, boundary_col)
+            b = cell.border
+            cell.border = Border(
+                left=b.left,
+                right=THICK,
+                top=b.top,
+                bottom=b.bottom,
+                diagonal=b.diagonal,
+                diagonal_direction=b.diagonal_direction,
+                outline=b.outline,
+                vertical=b.vertical,
+                horizontal=b.horizontal,
+            )
+
+    # --- 行方向（横方向）に細い罫線：各セルの bottom を thin にする ---
+    THIN = Side(style="thin", color="000000")
+    col_max = ws.max_column
+    for r in range(1, row_max + 1):
+        for c in range(1, col_max + 1):
+            cell = ws.cell(r, c)
+            b = cell.border
+            cell.border = Border(
+                left=b.left, right=b.right, top=b.top, bottom=THIN,
+                diagonal=b.diagonal, diagonal_direction=b.diagonal_direction,
+                outline=b.outline, vertical=b.vertical, horizontal=b.horizontal
+            )
+
+    # 先頭行の上端も線が欲しい場合（任意）
+    for c in range(1, col_max + 1):
+        cell = ws.cell(1, c)
+        b = cell.border
+        cell.border = Border(
+            left=b.left, right=b.right, top=THIN, bottom=b.bottom,
+            diagonal=b.diagonal, diagonal_direction=b.diagonal_direction,
+            outline=b.outline, vertical=b.vertical, horizontal=b.horizontal
+        )
 
     # 罫線っぽく見せる（列幅と固定）
     ws.freeze_panes = "B3"
