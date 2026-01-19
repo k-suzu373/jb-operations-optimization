@@ -123,7 +123,7 @@ class FormationState:
     loc: Any
     daysA: int
     daysB: int
-    prev_op_id: Optional[str] = None  # 前日に担当した運用ID（deadhead例外判定用
+    prev_op_id: Optional[str] = None  # 前日に担当した運用ID
 
 
 NON_DEADHEAD_LOC_JUMPS = {
@@ -134,6 +134,13 @@ NON_DEADHEAD_LOC_JUMPS = {
 NON_DEADHEAD_OP_CHAINS = {
     ("53B", "55B"),
 }  # 回送扱いしない運用の組み合わせ
+
+FIXED_NEXT_OP = {
+    "47B": "49B",
+    "53B": "55B",
+    "09B": "11B",
+    "81B": "83B",
+}  # 翌日固定になる運用の組み合わせ
 
 
 def make_baseline_schedule(
@@ -154,7 +161,11 @@ def make_baseline_schedule(
       - 余り編成は現在位置に対応する IDOL_* を割当（なければ default_idle_op）
     """
 
+    ops = ops.copy()
+    ops["operation_id"] = ops["operation_id"].astype(str)
     required_ops = ops[ops["required"] == 1].copy().reset_index(drop=True)
+    required_ops["operation_id"] = required_ops["operation_id"].astype(str)
+
     if priority_start_codes is None:
         priority_start_codes = ["JB01", "JB07", "JB18", "JB39"]  # 津田沼以外の優先駅
 
@@ -165,7 +176,7 @@ def make_baseline_schedule(
     )
 
     # operation_id→行の引き当て用（終点などを取る）
-    op_by_id = {row.operation_id: row for row in ops.itertuples(index=False)}
+    op_by_id = {str(row.operation_id): row for row in ops.itertuples(index=False)}
 
     # 編成状態
     state: Dict[str, FormationState] = {}
@@ -239,6 +250,32 @@ def make_baseline_schedule(
                 drop=True
             )
 
+        # 0) 翌日固定運用（47B→49B 等）を最優先で割当
+        fixed_targets = {}
+        req_ids = set(req_today["operation_id"].astype(str))
+        for formation_id in list(available):
+            prev = state[formation_id].prev_op_id
+            if prev in FIXED_NEXT_OP:
+                next_op = FIXED_NEXT_OP[prev]
+                if next_op in fixed_targets.values():
+                    raise ValueError(f"[{day}] 翌日固定が競合: {next_op}")
+                if next_op not in req_ids:
+                    raise ValueError(
+                        f"[{day}] 翌日固定の対象運用がrequiredに存在しない: {prev}→{next_op}"
+                    )
+                op_row = op_by_id.get(next_op)
+                if op_row is None:
+                    raise ValueError(
+                        f"[{day}] 翌日固定の対象運用がmaster_dataに存在しない: {next_op}"
+                    )
+                fixed_targets[formation_id] = op_row
+
+        # 固定割当（順序は軽くランダムでもOK。再現性はseedで担保）
+        fixed_items = list(fixed_targets.items())
+        rng.shuffle(fixed_items)
+        for formation_id, op_row in fixed_items:
+            assign_one(formation_id, op_row)
+
         # 1) 優先駅（JB01/JB07/JB18/JB39）にいる車両は「その駅始発」の運用へ
         for code in priority_start_codes:
             # その駅にいる編成
@@ -255,11 +292,11 @@ def make_baseline_schedule(
             if ops_here.empty:
                 continue
 
-            # ある分だけ割り当て（順序は formation_id の昇順で安定化）
-            formation_ids_here.sort()
-            for formation_id, op_row in zip(
-                formation_ids_here, ops_here.itertuples(index=False)
-            ):
+            # ある分だけ割り当て
+            rng.shuffle(formation_ids_here)
+            ops_here_list = list(ops_here.itertuples(index=False))
+            rng.shuffle(ops_here_list)
+            for formation_id, op_row in zip(formation_ids_here, ops_here_list):
                 assign_one(formation_id, op_row)
 
         # 2) 津田沼（tsudanuma_code）にいる車両は「残りrequired」からランダム割当
@@ -269,24 +306,20 @@ def make_baseline_schedule(
             if state[formation_id].loc == tsudanuma_code
         ]
         if formation_ids_tsudanuma and len(req_today) > 0:
-            formation_ids_tsudanuma.sort()
+            rng.shuffle(formation_ids_tsudanuma)
             remaining_ops = list(req_today.itertuples(index=False))
             rng.shuffle(remaining_ops)
             for formation_id, op_row in zip(formation_ids_tsudanuma, remaining_ops):
                 assign_one(formation_id, op_row)
 
         # 3) 残りの required は従来通り：位置一致優先、ダメなら deadhead 許容
-        for op_row in list(req_today.itertuples(index=False)):
-            # start_loc一致の編成を探す
-            pick = None
-            for formation_id in available:
-                if state[formation_id].loc == op_row.start_loc:
-                    pick = formation_id
-                    break
-            if pick is None:
-                # いなければ適当（ここはまだ制約緩い段階なので許容）
-                pick = available[0]
+        remaining_req = list(req_today.itertuples(index=False))
+        rng.shuffle(remaining_req)
+        for op_row in remaining_req:
+            candidates = [fid for fid in available if state[fid].loc == op_row.start_loc]
+            pick = rng.choice(candidates) if candidates else rng.choice(available)
             assign_one(pick, op_row)
+
 
         # 余り編成は待機運用へ
         for formation_id in available:
