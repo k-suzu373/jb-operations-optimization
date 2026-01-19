@@ -123,6 +123,17 @@ class FormationState:
     loc: Any
     daysA: int
     daysB: int
+    prev_op_id: Optional[str] = None  # 前日に担当した運用ID（deadhead例外判定用
+
+
+NON_DEADHEAD_LOC_JUMPS = {
+    ("JB33", "JB30"),
+    ("JB33", "JB35"),
+}  # 回送扱いしない駅の組み合わせ
+
+NON_DEADHEAD_OP_CHAINS = {
+    ("53B", "55B"),
+}  # 回送扱いしない運用の組み合わせ
 
 
 def make_baseline_schedule(
@@ -163,6 +174,7 @@ def make_baseline_schedule(
             loc=r.init_location,
             daysA=int(r.init_days_since_inspectionA),
             daysB=int(r.init_days_since_inspectionB),
+            prev_op_id=None,
         )
 
     formation_ids = list(forms["formation_id"].astype(str))
@@ -188,9 +200,21 @@ def make_baseline_schedule(
             """1編成に1運用を割当して、rows追加・state更新・availableから除外・req_todayから除外"""
             nonlocal req_today  # 関数外の変数を更新するためnonlocalをつける
             op_id = str(op_row.operation_id)
-            deadhead = int(
-                state[formation_id].loc != op_row.start_loc
-            )  # 回送して辻褄合わせした場合
+            prev_loc = to_station_code(state[formation_id].loc)
+            start_loc = to_station_code(op_row.start_loc)
+            prev_op = state[formation_id].prev_op_id
+
+            # 基本：前日の終点 != 当日の始点 なら回送
+            deadhead = int(prev_loc != start_loc)
+
+            # 例外1：JB33終 → 翌日JB30/JB35始 は回送扱いしない
+            if deadhead and (prev_loc, start_loc) in NON_DEADHEAD_LOC_JUMPS:
+                deadhead = 0
+
+            # 例外2：前日53B → 翌日55B は回送扱いしない（位置が違っていても）
+            if deadhead and (str(prev_op),op_id) in NON_DEADHEAD_OP_CHAINS:
+                deadhead = 0
+
 
             rows.append(
                 dict(
@@ -208,6 +232,7 @@ def make_baseline_schedule(
 
             # 状態更新
             state[formation_id].loc = op_row.end_loc
+            state[formation_id].prev_op_id = op_id
             if formation_id in available:
                 available.remove(formation_id)
             # req_todayからop_idを一件だけ消す
@@ -287,6 +312,7 @@ def make_baseline_schedule(
             # 待機運用にも end_loc があれば反映
             if idle_row:
                 state[formation_id].loc = idle_row.end_loc
+            state[formation_id].prev_op_id = str(idle_op)
 
         # 日数カウンタ更新（制約なしでも出力に入れておくと後で便利）
         for formation_id in formation_ids:
@@ -546,9 +572,15 @@ def add_formation_triplet_sheet(
             cell = ws.cell(r, c)
             b = cell.border
             cell.border = Border(
-                left=b.left, right=b.right, top=b.top, bottom=THIN,
-                diagonal=b.diagonal, diagonal_direction=b.diagonal_direction,
-                outline=b.outline, vertical=b.vertical, horizontal=b.horizontal
+                left=b.left,
+                right=b.right,
+                top=b.top,
+                bottom=THIN,
+                diagonal=b.diagonal,
+                diagonal_direction=b.diagonal_direction,
+                outline=b.outline,
+                vertical=b.vertical,
+                horizontal=b.horizontal,
             )
 
     # 先頭行の上端も線が欲しい場合（任意）
@@ -556,9 +588,15 @@ def add_formation_triplet_sheet(
         cell = ws.cell(1, c)
         b = cell.border
         cell.border = Border(
-            left=b.left, right=b.right, top=THIN, bottom=b.bottom,
-            diagonal=b.diagonal, diagonal_direction=b.diagonal_direction,
-            outline=b.outline, vertical=b.vertical, horizontal=b.horizontal
+            left=b.left,
+            right=b.right,
+            top=THIN,
+            bottom=b.bottom,
+            diagonal=b.diagonal,
+            diagonal_direction=b.diagonal_direction,
+            outline=b.outline,
+            vertical=b.vertical,
+            horizontal=b.horizontal,
         )
 
     # 罫線っぽく見せる（列幅と固定）
