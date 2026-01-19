@@ -212,9 +212,8 @@ def make_baseline_schedule(
                 deadhead = 0
 
             # 例外2：前日53B → 翌日55B は回送扱いしない（位置が違っていても）
-            if deadhead and (str(prev_op),op_id) in NON_DEADHEAD_OP_CHAINS:
+            if deadhead and (str(prev_op), op_id) in NON_DEADHEAD_OP_CHAINS:
                 deadhead = 0
-
 
             rows.append(
                 dict(
@@ -512,6 +511,9 @@ def add_formation_triplet_sheet(
     p_op = schedule_copy.pivot(
         index="day", columns="formation_id", values="operation_id"
     ).reindex(index=days, columns=formations)
+    p_dead = schedule_copy.pivot(
+        index="day", columns="formation_id", values="deadhead"
+    ).reindex(index=days, columns=formations)
 
     # Data rows
     out_r = 3  # 3行目から
@@ -524,6 +526,7 @@ def add_formation_triplet_sheet(
             sv = to_station_code(p_start.loc[day, formation_id])
             ev = to_station_code(p_end.loc[day, formation_id])
             ov = p_op.loc[day, formation_id]
+            dv = p_dead.loc[day, formation_id]
 
             c_start = ws.cell(out_r, col, sv)
             c_end = ws.cell(out_r, col + 1, ev)
@@ -538,6 +541,11 @@ def add_formation_triplet_sheet(
 
             # operation は中央寄せ
             c_op.alignment = Alignment(horizontal="center", vertical="center")
+
+            # deadhead=1 のとき：startセルを「赤字＋太字」
+            if pd.notna(dv) and int(dv) == 1:
+                # 既存フォント設定は引き継いで、色と太字だけ上書き
+                c_start.font = c_start.font.copy(color="FF0000", bold=True)
 
             col += 3
         out_r += 1
