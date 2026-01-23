@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
 import pandas as pd
 import openpyxl
+from ortools.sat.python import cp_model
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
@@ -79,9 +80,10 @@ def set_white_font(cell, value):
         cell.font = FONT_WHITE
 
 
-def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     ops = pd.read_excel(master_path, sheet_name="operations")
     forms = pd.read_excel(master_path, sheet_name="formations")
+    rules = pd.read_excel(master_path, sheet_name="rules")
 
     # 想定する最低限の列
     _require_columns(
@@ -107,12 +109,29 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         sheet="formations",
     )  # 編成
 
+    _require_columns(
+        rules,
+        required=[
+            "max_days_since_inspectionA",
+            "max_days_since_inspectionB",
+        ],
+        sheet="rules",
+    )
+
     # IDは文字列に寄せる（Excel側で数字扱いでも安定）
     ops["start_loc"] = ops["start_loc"].map(to_station_code)
     ops["end_loc"] = ops["end_loc"].map(to_station_code)
     forms["init_location"] = forms["init_location"].map(to_station_code)
 
-    return ops, forms
+    rules_row = rules.iloc[0].to_dict()
+    return (
+        ops,
+        forms,
+        {
+            "max_days_since_inspectionA": int(rules_row["max_days_since_inspectionA"]),
+            "max_days_since_inspectionB": int(rules_row["max_days_since_inspectionB"]),
+        },
+    )
 
 
 # ---------- Core logic (baseline allocator) ----------
@@ -146,6 +165,8 @@ FIXED_NEXT_OP = {
 def make_baseline_schedule(
     ops: pd.DataFrame,
     forms: pd.DataFrame,
+    max_days_since_inspectionA: int,
+    max_days_since_inspectionB: int,
     days: int = 30,
     start_date: Optional[str] = None,
     default_idle_op: str = "IDOL_Mitaka",
@@ -168,6 +189,8 @@ def make_baseline_schedule(
 
     if priority_start_codes is None:
         priority_start_codes = ["JB01", "JB07", "JB18", "JB39"]  # 津田沼以外の優先駅
+
+    inspection_a_start_codes = {"JB01", "JB07", "JB33"}
 
     # 予備待機（required=0 かつ 検査Bじゃないもの）から start_loc→operation_id を作る
     idle_ops = ops[(ops["required"] == 0) & (ops["is_inspection_B"] == 0)].copy()
@@ -203,16 +226,24 @@ def make_baseline_schedule(
         day = day_labels[di]
         available = formation_ids.copy()  # 使える編成
         rng = random.Random(seed + di)  # 日ごとに乱数固定
+        assigned_inspection_b_ops: set[str] = set()
 
         # required運用の未割当リスト（その日ごとに消し込む）
         req_today = required_ops.copy()
 
-        def assign_one(formation_id: str, op_row) -> None:
+        def record_assignment(
+            formation_id: str,
+            op_id: str,
+            op_start_loc: Any,
+            op_end_loc: Any,
+            is_inspection_B: int,
+            status: str,
+            remove_required: bool,
+        ) -> None:
             """1編成に1運用を割当して、rows追加・state更新・availableから除外・req_todayから除外"""
             nonlocal req_today  # 関数外の変数を更新するためnonlocalをつける
-            op_id = str(op_row.operation_id)
             prev_loc = to_station_code(state[formation_id].loc)
-            start_loc = to_station_code(op_row.start_loc)
+            start_loc = to_station_code(op_start_loc)
             prev_op = state[formation_id].prev_op_id
 
             # 基本：前日の終点 != 当日の始点 なら回送
@@ -226,28 +257,61 @@ def make_baseline_schedule(
             if deadhead and (str(prev_op), op_id) in NON_DEADHEAD_OP_CHAINS:
                 deadhead = 0
 
+            daysA_before = state[formation_id].daysA
+            daysB_before = state[formation_id].daysB
+            overdueA = int(daysA_before >= max_days_since_inspectionA + 1)
+            overdueB = int(daysB_before >= max_days_since_inspectionB + 1)
+            did_inspection_A = int(
+                daysA_before in (6, 7) and start_loc in inspection_a_start_codes
+            )
+            did_inspection_B = int(daysB_before >= 20 and int(is_inspection_B) == 1)
+
             rows.append(
                 dict(
                     day=day,
                     formation_id=formation_id,
                     operation_id=op_id,
-                    status="RUN",
-                    op_start_loc=op_row.start_loc,
-                    op_end_loc=op_row.end_loc,
+                    status=status,
+                    op_start_loc=op_start_loc,
+                    op_end_loc=op_end_loc,
                     deadhead=deadhead,
-                    daysA_before=state[formation_id].daysA,
-                    daysB_before=state[formation_id].daysB,
+                    daysA_before=daysA_before,
+                    daysB_before=daysB_before,
+                    overdueA=overdueA,
+                    overdueB=overdueB,
+                    did_inspection_A=did_inspection_A,
+                    did_inspection_B=did_inspection_B,
                 )
             )
 
             # 状態更新
-            state[formation_id].loc = op_row.end_loc
+            state[formation_id].loc = op_end_loc
             state[formation_id].prev_op_id = op_id
+            if did_inspection_A:
+                state[formation_id].daysA = 0
+            if did_inspection_B:
+                state[formation_id].daysB = 0
             if formation_id in available:
                 available.remove(formation_id)
-            # req_todayからop_idを一件だけ消す
-            req_today = req_today[req_today["operation_id"] != op_id].reset_index(
-                drop=True
+            if int(is_inspection_B) == 1:
+                if op_id in assigned_inspection_b_ops:
+                    raise ValueError(f"[{day}] 検査B運用が重複: {op_id}")
+                assigned_inspection_b_ops.add(op_id)
+            if remove_required:
+                # req_todayからop_idを一件だけ消す
+                req_today = req_today[req_today["operation_id"] != op_id].reset_index(
+                    drop=True
+                )
+
+        def assign_one(formation_id: str, op_row) -> None:
+            record_assignment(
+                formation_id=formation_id,
+                op_id=str(op_row.operation_id),
+                op_start_loc=op_row.start_loc,
+                op_end_loc=op_row.end_loc,
+                is_inspection_B=int(op_row.is_inspection_B),
+                status="RUN",
+                remove_required=True,
             )
 
         # 0) 翌日固定運用（47B→49B 等）を最優先で割当
@@ -275,6 +339,88 @@ def make_baseline_schedule(
         rng.shuffle(fixed_items)
         for formation_id, op_row in fixed_items:
             assign_one(formation_id, op_row)
+
+        # 1) 検査Bの割当（CP-SATで期限の近い編成を優先）
+        b_ops = ops[ops["is_inspection_B"] == 1].copy()
+        if not b_ops.empty:
+            b_ops = b_ops[
+                ~b_ops["operation_id"].astype(str).isin(assigned_inspection_b_ops)
+            ]
+        eligible_formations = [
+            formation_id
+            for formation_id in available
+            if state[formation_id].daysB >= 20
+        ]
+        if not b_ops.empty and eligible_formations:
+            model = cp_model.CpModel()
+            b_op_ids = list(b_ops["operation_id"].astype(str))
+            y: Dict[Tuple[str, str], cp_model.IntVar] = {}
+            for formation_id in eligible_formations:
+                for op_id in b_op_ids:
+                    y[(formation_id, op_id)] = model.NewBoolVar(
+                        f"y_{formation_id}_{op_id}"
+                    )
+            for formation_id in eligible_formations:
+                model.Add(
+                    sum(y[(formation_id, op_id)] for op_id in b_op_ids) <= 1
+                )
+            for op_id in b_op_ids:
+                model.Add(
+                    sum(y[(formation_id, op_id)] for formation_id in eligible_formations)
+                    <= 1
+                )
+            # daysB_before が大きい編成ほど優先（期限が近い編成を優先割当）
+            model.Maximize(
+                sum(
+                    y[(formation_id, op_id)] * state[formation_id].daysB
+                    for formation_id in eligible_formations
+                    for op_id in b_op_ids
+                )
+            )
+            solver = cp_model.CpSolver()
+            status = solver.Solve(model)
+            if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                assignments = []
+                for formation_id in eligible_formations:
+                    for op_id in b_op_ids:
+                        if solver.Value(y[(formation_id, op_id)]) == 1:
+                            assignments.append((formation_id, op_id))
+                for formation_id, op_id in assignments:
+                    op_row = op_by_id.get(op_id)
+                    if op_row is None:
+                        raise ValueError(
+                            f"[{day}] 検査Bの対象運用がmaster_dataに存在しない: {op_id}"
+                        )
+                    assign_one(formation_id, op_row)
+
+        # 2) 検査Aの優先割当（daysA_beforeが7→6の順で、指定駅始発へ寄せる）
+        def assign_a_priority(target_days: int) -> None:
+            candidates = [
+                formation_id
+                for formation_id in available
+                if state[formation_id].daysA == target_days
+            ]
+            if not candidates:
+                return
+            rng.shuffle(candidates)
+            for start_code in inspection_a_start_codes:
+                ops_here = req_today[req_today["start_loc"] == start_code].copy()
+                if ops_here.empty:
+                    continue
+                ops_here_list = list(ops_here.itertuples(index=False))
+                rng.shuffle(ops_here_list)
+                for op_row in ops_here_list:
+                    if not candidates:
+                        return
+                    loc_matched = [
+                        fid for fid in candidates if state[fid].loc == start_code
+                    ]
+                    pick = loc_matched[0] if loc_matched else candidates[0]
+                    candidates.remove(pick)
+                    assign_one(pick, op_row)
+
+        assign_a_priority(7)
+        assign_a_priority(6)
 
         # 1) 優先駅（JB01/JB07/JB18/JB39）にいる車両は「その駅始発」の運用へ
         for code in priority_start_codes:
@@ -320,33 +466,23 @@ def make_baseline_schedule(
             pick = rng.choice(candidates) if candidates else rng.choice(available)
             assign_one(pick, op_row)
 
-
         # 余り編成は待機運用へ
-        for formation_id in available:
+        for formation_id in list(available):
             loc = state[formation_id].loc
             idle_op = idle_by_start.get(loc, default_idle_op)
             idle_row = op_by_id.get(idle_op, None)
 
-            rows.append(
-                dict(
-                    day=day,
-                    formation_id=formation_id,
-                    operation_id=idle_op,
-                    status="IDLE",
-                    op_start_loc=(idle_row.start_loc if idle_row else loc),
-                    op_end_loc=(idle_row.end_loc if idle_row else loc),
-                    deadhead=0,
-                    daysA_before=state[formation_id].daysA,
-                    daysB_before=state[formation_id].daysB,
-                )
+            record_assignment(
+                formation_id=formation_id,
+                op_id=str(idle_op),
+                op_start_loc=(idle_row.start_loc if idle_row else loc),
+                op_end_loc=(idle_row.end_loc if idle_row else loc),
+                is_inspection_B=int(idle_row.is_inspection_B) if idle_row else 0,
+                status="IDLE",
+                remove_required=False,
             )
 
-            # 待機運用にも end_loc があれば反映
-            if idle_row:
-                state[formation_id].loc = idle_row.end_loc
-            state[formation_id].prev_op_id = str(idle_op)
-
-        # 日数カウンタ更新（制約なしでも出力に入れておくと後で便利）
+        # 日数カウンタ更新（検査成立なら0に戻し、その後に日末で+1）
         for formation_id in formation_ids:
             state[formation_id].daysA += 1
             state[formation_id].daysB += 1
@@ -647,6 +783,133 @@ def add_formation_triplet_sheet(
         ws.column_dimensions[get_column_letter(col)].width = 10
 
 
+def add_inspection_triplet_sheet(
+    wb: openpyxl.Workbook,
+    name: str,
+    schedule: pd.DataFrame,
+    days: list[str],
+    formations: list[str],
+) -> None:
+    ws = wb.create_sheet(name)
+
+    ws.cell(1, 1, None)
+    col = 2
+    for formation_id in formations:
+        ws.cell(1, col, formation_id)
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
+        col += 3
+
+    ws.cell(2, 1, None)
+    col = 2
+    for _ in formations:
+        ws.cell(2, col, "operation")
+        ws.cell(2, col + 1, "init_days_since_inspectionA")
+        ws.cell(2, col + 2, "init_days_since_inspectionB")
+        col += 3
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(color="FFFFFF", bold=True)
+    for r in (1, 2):
+        for cell in ws[r]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    schedule_copy = schedule.copy()
+    schedule_copy["day"] = schedule_copy["day"].astype(str)
+    schedule_copy["formation_id"] = schedule_copy["formation_id"].astype(str)
+
+    p_op = schedule_copy.pivot(
+        index="day", columns="formation_id", values="operation_id"
+    ).reindex(index=days, columns=formations)
+    p_daysA = schedule_copy.pivot(
+        index="day", columns="formation_id", values="daysA_before"
+    ).reindex(index=days, columns=formations)
+    p_daysB = schedule_copy.pivot(
+        index="day", columns="formation_id", values="daysB_before"
+    ).reindex(index=days, columns=formations)
+
+    out_r = 3
+    for day in days:
+        ws.cell(out_r, 1, day)
+        ws.cell(out_r, 1).alignment = Alignment(horizontal="center", vertical="center")
+
+        col = 2
+        for formation_id in formations:
+            ov = p_op.loc[day, formation_id]
+            av = p_daysA.loc[day, formation_id]
+            bv = p_daysB.loc[day, formation_id]
+
+            c_op = ws.cell(out_r, col, (None if pd.isna(ov) else str(ov)))
+            c_a = ws.cell(out_r, col + 1, (None if pd.isna(av) else int(av)))
+            c_b = ws.cell(out_r, col + 2, (None if pd.isna(bv) else int(bv)))
+
+            for cell in (c_op, c_a, c_b):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            col += 3
+        out_r += 1
+
+    THICK = Side(style="thick", color="000000")
+    row_max = ws.max_row
+    start_col = 2
+    cols_per = 3
+    for i in range(len(formations)):
+        boundary_col = start_col + cols_per * (i + 1) - 1
+        for r in range(1, row_max + 1):
+            cell = ws.cell(r, boundary_col)
+            b = cell.border
+            cell.border = Border(
+                left=b.left,
+                right=THICK,
+                top=b.top,
+                bottom=b.bottom,
+                diagonal=b.diagonal,
+                diagonal_direction=b.diagonal_direction,
+                outline=b.outline,
+                vertical=b.vertical,
+                horizontal=b.horizontal,
+            )
+
+    THIN = Side(style="thin", color="000000")
+    col_max = ws.max_column
+    for r in range(1, row_max + 1):
+        for c in range(1, col_max + 1):
+            cell = ws.cell(r, c)
+            b = cell.border
+            cell.border = Border(
+                left=b.left,
+                right=b.right,
+                top=b.top,
+                bottom=THIN,
+                diagonal=b.diagonal,
+                diagonal_direction=b.diagonal_direction,
+                outline=b.outline,
+                vertical=b.vertical,
+                horizontal=b.horizontal,
+            )
+
+    for c in range(1, col_max + 1):
+        cell = ws.cell(1, c)
+        b = cell.border
+        cell.border = Border(
+            left=b.left,
+            right=b.right,
+            top=THIN,
+            bottom=b.bottom,
+            diagonal=b.diagonal,
+            diagonal_direction=b.diagonal_direction,
+            outline=b.outline,
+            vertical=b.vertical,
+            horizontal=b.horizontal,
+        )
+
+    ws.freeze_panes = "B3"
+    ws.column_dimensions["A"].width = 8
+    for col in range(2, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 10
+
+
 # Excel出力
 def export_baseline_excel(
     out_path: str,
@@ -674,6 +937,9 @@ def export_baseline_excel(
     days = sorted(schedule["day"].astype(str).unique(), key=lambda s: (len(s), s))
     formations = sorted(schedule["formation_id"].astype(str).unique())
     add_formation_triplet_sheet(wb, "gantt_triplet", schedule, days, formations)
+    add_inspection_triplet_sheet(
+        wb, "gantt_inspection_triplet", schedule, days, formations
+    )
     add_sheet_from_df(
         wb,
         "master_operations",
@@ -727,10 +993,12 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    ops, forms = read_master(args.master)
+    ops, forms, rules = read_master(args.master)
     schedule, gantt_ops, gantt_start, gantt_end = make_baseline_schedule(
         ops,
         forms,
+        max_days_since_inspectionA=rules["max_days_since_inspectionA"],
+        max_days_since_inspectionB=rules["max_days_since_inspectionB"],
         days=args.days,
         start_date=args.start_date,
         default_idle_op=args.default_idle_op,
