@@ -370,9 +370,19 @@ def make_baseline_schedule(
                     <= 1
                 )
             # daysB_before が大きい編成ほど優先（期限が近い編成を優先割当）
+            # 併せて start_loc が一致する割当を優先し、deadhead を減らす。
             model.Maximize(
                 sum(
-                    y[(formation_id, op_id)] * state[formation_id].daysB
+                    y[(formation_id, op_id)]
+                    * (
+                        state[formation_id].daysB * 10
+                        + (
+                            1
+                            if state[formation_id].loc
+                            == op_by_id[op_id].start_loc
+                            else 0
+                        )
+                    )
                     for formation_id in eligible_formations
                     for op_id in b_op_ids
                 )
