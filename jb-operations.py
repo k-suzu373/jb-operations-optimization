@@ -116,9 +116,10 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
             "max_days_since_inspectionB",
         ],
         sheet="rules",
-    )
+    ) #検査までの日数
 
     # IDは文字列に寄せる（Excel側で数字扱いでも安定）
+    # map関数でリストを文字列化したものを新しいリストに更新
     ops["start_loc"] = ops["start_loc"].map(to_station_code)
     ops["end_loc"] = ops["end_loc"].map(to_station_code)
     forms["init_location"] = forms["init_location"].map(to_station_code)
@@ -190,7 +191,7 @@ def make_baseline_schedule(
     if priority_start_codes is None:
         priority_start_codes = ["JB01", "JB07", "JB18", "JB39"]  # 津田沼以外の優先駅
 
-    inspection_a_start_codes = {"JB01", "JB07", "JB33"}
+    inspection_a_start_codes = {"JB01", "JB07", "JB33"} # A検査可能駅
 
     # 予備待機（required=0 かつ 検査Bじゃないもの）から start_loc→operation_id を作る
     idle_ops = ops[(ops["required"] == 0) & (ops["is_inspection_B"] == 0)].copy()
