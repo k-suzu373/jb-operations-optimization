@@ -132,7 +132,7 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
             "max_days_since_inspectionA": int(rules_row["max_days_since_inspectionA"]),
             "max_days_since_inspectionB": int(rules_row["max_days_since_inspectionB"]),
         },
-    )
+    ) #検査までの日数設定
 
 
 # ---------- Core logic (baseline allocator) ----------
@@ -258,6 +258,7 @@ def make_baseline_schedule(
             if deadhead and (str(prev_op), op_id) in NON_DEADHEAD_OP_CHAINS:
                 deadhead = 0
 
+            #検査期限とオーバーの設定
             daysA_before = state[formation_id].daysA
             daysB_before = state[formation_id].daysB
             overdueA = int(daysA_before >= max_days_since_inspectionA + 1)
@@ -335,7 +336,6 @@ def make_baseline_schedule(
                     )
                 fixed_targets[formation_id] = op_row
 
-        # 固定割当（順序は軽くランダムでもOK。再現性はseedで担保）
         fixed_items = list(fixed_targets.items())
         rng.shuffle(fixed_items)
         for formation_id, op_row in fixed_items:
@@ -347,11 +347,14 @@ def make_baseline_schedule(
             b_ops = b_ops[
                 ~b_ops["operation_id"].astype(str).isin(assigned_inspection_b_ops)
             ]
+
         eligible_formations = [
             formation_id
             for formation_id in available
             if state[formation_id].daysB >= 20
-        ]
+        ] # B検査から20日以上経過した編成をリストアップ
+
+
         if not b_ops.empty and eligible_formations:
             model = cp_model.CpModel()
             b_op_ids = list(b_ops["operation_id"].astype(str))
@@ -360,17 +363,20 @@ def make_baseline_schedule(
                 for op_id in b_op_ids:
                     y[(formation_id, op_id)] = model.NewBoolVar(
                         f"y_{formation_id}_{op_id}"
-                    )
+                    ) #formation_id を、B検査運用 op_id に割り当てるなら 1、割り当てないなら 0
+
             for formation_id in eligible_formations:
                 model.Add(
                     sum(y[(formation_id, op_id)] for op_id in b_op_ids) <= 1
-                )
+                ) # 同じ編成が複数のB運用に同時に入るのはダメ
+
             for op_id in b_op_ids:
                 model.Add(
                     sum(y[(formation_id, op_id)] for formation_id in eligible_formations)
                     <= 1
-                )
-            # daysB_before が大きい編成ほど優先（期限が近い編成を優先割当）
+                ) #同じB運用枠に複数編成を突っ込むのはダメ
+
+            # スコアをつけてdaysB_before が大きい編成ほど優先（期限が近い編成を優先割当）
             # 併せて start_loc が一致する割当を優先し、deadhead を減らす。
             model.Maximize(
                 sum(
@@ -388,6 +394,7 @@ def make_baseline_schedule(
                     for op_id in b_op_ids
                 )
             )
+
             solver = cp_model.CpSolver()
             status = solver.Solve(model)
             if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -396,6 +403,7 @@ def make_baseline_schedule(
                     for op_id in b_op_ids:
                         if solver.Value(y[(formation_id, op_id)]) == 1:
                             assignments.append((formation_id, op_id))
+                            #確定した組み合わせに割り当て
                 for formation_id, op_id in assignments:
                     op_row = op_by_id.get(op_id)
                     if op_row is None:
