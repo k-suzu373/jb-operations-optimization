@@ -116,7 +116,7 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
             "max_days_since_inspectionB",
         ],
         sheet="rules",
-    ) #検査までの日数
+    )  # 検査までの日数
 
     # IDは文字列に寄せる（Excel側で数字扱いでも安定）
     # map関数でリストを文字列化したものを新しいリストに更新
@@ -132,7 +132,7 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
             "max_days_since_inspectionA": int(rules_row["max_days_since_inspectionA"]),
             "max_days_since_inspectionB": int(rules_row["max_days_since_inspectionB"]),
         },
-    ) #検査までの日数設定
+    )  # 検査までの日数設定
 
 
 # ---------- Core logic (baseline allocator) ----------
@@ -191,7 +191,7 @@ def make_baseline_schedule(
     if priority_start_codes is None:
         priority_start_codes = ["JB01", "JB07", "JB18", "JB39"]  # 津田沼以外の優先駅
 
-    inspection_a_start_codes = {"JB01", "JB07", "JB33"} # A検査可能駅
+    inspection_a_start_codes = {"JB01", "JB07", "JB33"}  # A検査可能駅
 
     # 予備待機（required=0 かつ 検査Bじゃないもの）から start_loc→operation_id を作る
     idle_ops = ops[(ops["required"] == 0) & (ops["is_inspection_B"] == 0)].copy()
@@ -258,7 +258,7 @@ def make_baseline_schedule(
             if deadhead and (str(prev_op), op_id) in NON_DEADHEAD_OP_CHAINS:
                 deadhead = 0
 
-            #検査期限とオーバーの設定
+            # 検査期限とオーバーの設定
             daysA_before = state[formation_id].daysA
             daysB_before = state[formation_id].daysB
             overdueA = int(daysA_before >= max_days_since_inspectionA + 1)
@@ -352,8 +352,7 @@ def make_baseline_schedule(
             formation_id
             for formation_id in available
             if state[formation_id].daysB >= 20
-        ] # B検査から20日以上経過した編成をリストアップ
-
+        ]  # B検査から20日以上経過した編成をリストアップ
 
         if not b_ops.empty and eligible_formations:
             model = cp_model.CpModel()
@@ -363,18 +362,20 @@ def make_baseline_schedule(
                 for op_id in b_op_ids:
                     y[(formation_id, op_id)] = model.NewBoolVar(
                         f"y_{formation_id}_{op_id}"
-                    ) #formation_id を、B検査運用 op_id に割り当てるなら 1、割り当てないなら 0
+                    )  # formation_id を、B検査運用 op_id に割り当てるなら 1、割り当てないなら 0
 
             for formation_id in eligible_formations:
                 model.Add(
                     sum(y[(formation_id, op_id)] for op_id in b_op_ids) <= 1
-                ) # 同じ編成が複数のB運用に同時に入るのはダメ
+                )  # 同じ編成が複数のB運用に同時に入るのはダメ
 
             for op_id in b_op_ids:
                 model.Add(
-                    sum(y[(formation_id, op_id)] for formation_id in eligible_formations)
+                    sum(
+                        y[(formation_id, op_id)] for formation_id in eligible_formations
+                    )
                     <= 1
-                ) #同じB運用枠に複数編成を突っ込むのはダメ
+                )  # 同じB運用枠に複数編成を突っ込むのはダメ
 
             # スコアをつけてdaysB_before が大きい編成ほど優先（期限が近い編成を優先割当）
             # 併せて start_loc が一致する割当を優先し、deadhead を減らす。
@@ -385,8 +386,7 @@ def make_baseline_schedule(
                         state[formation_id].daysB * 10
                         + (
                             1
-                            if state[formation_id].loc
-                            == op_by_id[op_id].start_loc
+                            if state[formation_id].loc == op_by_id[op_id].start_loc
                             else 0
                         )
                     )
@@ -403,7 +403,7 @@ def make_baseline_schedule(
                     for op_id in b_op_ids:
                         if solver.Value(y[(formation_id, op_id)]) == 1:
                             assignments.append((formation_id, op_id))
-                            #確定した組み合わせに割り当て
+                            # 確定した組み合わせに割り当て
                 for formation_id, op_id in assignments:
                     op_row = op_by_id.get(op_id)
                     if op_row is None:
@@ -481,7 +481,9 @@ def make_baseline_schedule(
         remaining_req = list(req_today.itertuples(index=False))
         rng.shuffle(remaining_req)
         for op_row in remaining_req:
-            candidates = [fid for fid in available if state[fid].loc == op_row.start_loc]
+            candidates = [
+                fid for fid in available if state[fid].loc == op_row.start_loc
+            ]
             pick = rng.choice(candidates) if candidates else rng.choice(available)
             assign_one(pick, op_row)
 
