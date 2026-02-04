@@ -172,6 +172,7 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
     for opt_col in [
         "init_distance_since_inspectionB_km",
         "init_total_distance_km",
+        "distance_km",
     ]:
         if opt_col in forms.columns and forms[opt_col].isna().any():
             raise ValueError(f"[formations] {opt_col} に欠損があります")
@@ -263,12 +264,15 @@ def make_baseline_schedule(
     # 編成状態
     state: Dict[str, FormationState] = {}
     for r in forms.itertuples(index=False):
+        formation_distance = getattr(r, "distance_km", None)
+        if formation_distance is None:
+            formation_distance = getattr(r, "init_total_distance_km", 0)
         state[str(r.formation_id)] = FormationState(
             loc=r.init_location,
             daysA=int(r.init_days_since_inspectionA),
             daysB=int(r.init_days_since_inspectionB),
             distB_km=int(getattr(r, "init_distance_since_inspectionB_km", 0) or 0),
-            total_km=int(getattr(r, "init_total_distance_km", 0) or 0),
+            total_km=int(formation_distance or 0),
             prev_op_id=None,
         )
 
