@@ -154,6 +154,8 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
             "init_location",
             "init_days_since_inspectionA",
             "init_days_since_inspectionB",
+            "init_distance_since_inspectionB_km",
+            "init_total_distance_km",
         ],
         sheet="formations",
     )  # 編成
@@ -172,7 +174,6 @@ def read_master(master_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
     for opt_col in [
         "init_distance_since_inspectionB_km",
         "init_total_distance_km",
-        "distance_km",
     ]:
         if opt_col in forms.columns and forms[opt_col].isna().any():
             raise ValueError(f"[formations] {opt_col} に欠損があります")
@@ -264,15 +265,12 @@ def make_baseline_schedule(
     # 編成状態
     state: Dict[str, FormationState] = {}
     for r in forms.itertuples(index=False):
-        formation_distance = getattr(r, "distance_km", None)
-        if formation_distance is None:
-            formation_distance = getattr(r, "init_total_distance_km", 0)
         state[str(r.formation_id)] = FormationState(
             loc=r.init_location,
             daysA=int(r.init_days_since_inspectionA),
             daysB=int(r.init_days_since_inspectionB),
             distB_km=int(getattr(r, "init_distance_since_inspectionB_km", 0) or 0),
-            total_km=int(formation_distance or 0),
+            total_km=int(getattr(r, "init_total_distance_km", 0) or 0),
             prev_op_id=None,
         )
 
@@ -305,7 +303,9 @@ def make_baseline_schedule(
         # required運用の未割当リスト（その日ごとに消し込む）
         req_today = required_ops.copy()
 
-        def compute_deadhead(prev_loc: Any, start_loc: Any, prev_op: Any, op_id: str) -> int:
+        def compute_deadhead(
+            prev_loc: Any, start_loc: Any, prev_op: Any, op_id: str
+        ) -> int:
             # 基本：前日の終点 != 当日の始点 なら回送
             deadhead = int(prev_loc != start_loc)
 
@@ -545,7 +545,9 @@ def make_baseline_schedule(
                     loc_matched = [
                         fid for fid in candidates if state[fid].loc == start_code
                     ]
-                    ordered = loc_matched + [fid for fid in candidates if fid not in loc_matched]
+                    ordered = loc_matched + [
+                        fid for fid in candidates if fid not in loc_matched
+                    ]
                     pick = next(
                         (fid for fid in ordered if can_assign_distB(fid, op_row)), None
                     )
@@ -587,9 +589,7 @@ def make_baseline_schedule(
                     distance_km = int(op.distance_km)
                     is_inspection_B = int(op.is_inspection_B)
 
-                    did_inspection_B = int(
-                        daysB_before >= 20 and is_inspection_B == 1
-                    )
+                    did_inspection_B = int(daysB_before >= 20 and is_inspection_B == 1)
                     if did_inspection_B:
                         distB_after = 0
                     else:
@@ -603,17 +603,12 @@ def make_baseline_schedule(
                     distance_map[(formation_id, op_id)] = distance_km
 
                     did_inspection_A = int(
-                        daysA_before in (6, 7)
-                        and start_loc in inspection_a_start_codes
+                        daysA_before in (6, 7) and start_loc in inspection_a_start_codes
                     )
                     daysA_after = (0 if did_inspection_A else daysA_before) + 1
                     daysB_after = (0 if did_inspection_B else daysB_before) + 1
-                    overdueA_after = int(
-                        daysA_after >= max_days_since_inspectionA + 1
-                    )
-                    overdueB_after = int(
-                        daysB_after >= max_days_since_inspectionB + 1
-                    )
+                    overdueA_after = int(daysA_after >= max_days_since_inspectionA + 1)
+                    overdueB_after = int(daysB_after >= max_days_since_inspectionB + 1)
                     overdue_cost[(formation_id, op_id)] = (
                         overdueA_idle
                         + overdueB_idle
@@ -651,7 +646,9 @@ def make_baseline_schedule(
                 f_state = state[formation_id]
                 total_before = f_state.total_km
                 total_after = model.NewIntVar(
-                    total_before, total_before + max_distance_today, f"total_{formation_id}"
+                    total_before,
+                    total_before + max_distance_today,
+                    f"total_{formation_id}",
                 )
                 model.Add(
                     total_after
@@ -747,12 +744,8 @@ def make_baseline_schedule(
             row["daysB_after"] = state[fid].daysB
             row["distB_km_after"] = state[fid].distB_km
             row["total_km_after"] = state[fid].total_km
-            row["overdueA"] = int(
-                state[fid].daysA >= max_days_since_inspectionA + 1
-            )
-            row["overdueB"] = int(
-                state[fid].daysB >= max_days_since_inspectionB + 1
-            )
+            row["overdueA"] = int(state[fid].daysA >= max_days_since_inspectionA + 1)
+            row["overdueB"] = int(state[fid].daysB >= max_days_since_inspectionB + 1)
 
     schedule = (
         pd.DataFrame(rows).sort_values(["day", "formation_id"]).reset_index(drop=True)
@@ -1115,9 +1108,7 @@ def add_inspection_triplet_sheet(
             c_op = ws.cell(out_r, col, (None if pd.isna(ov) else str(ov)))
             c_a = ws.cell(out_r, col + 1, (None if pd.isna(av) else int(av)))
             c_b = ws.cell(out_r, col + 2, (None if pd.isna(bv) else int(bv)))
-            c_d = ws.cell(
-                out_r, col + 3, (None if pd.isna(dv) else int(dv))
-            )
+            c_d = ws.cell(out_r, col + 3, (None if pd.isna(dv) else int(dv)))
 
             for cell in (c_op, c_a, c_b, c_d):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
