@@ -345,7 +345,7 @@ def make_baseline_schedule(
 
             deadhead = compute_deadhead(prev_loc, start_loc, prev_op, op_id)
 
-            # 検査成立判定→当日運用後カウンタ計算（検査当日は0日）
+            # 検査期限とオーバーの設定
             daysA_before = state[formation_id].daysA
             daysB_before = state[formation_id].daysB
             distB_before = state[formation_id].distB_km
@@ -356,10 +356,7 @@ def make_baseline_schedule(
             did_inspection_B = int(daysB_before >= 20 and int(is_inspection_B) == 1)
             distance_km = int(op_by_id[op_id].distance_km) if op_id in op_by_id else 0
 
-            daysA_after = 0 if did_inspection_A else daysA_before + 1
-            daysB_after = 0 if did_inspection_B else daysB_before + 1
-
-            # distBはB検査成立なら0、それ以外は当日走行距離を加算
+            # 運用後に距離を更新（B検査成立ならリセット）
             if did_inspection_B:
                 distB_after = 0
             else:
@@ -386,8 +383,8 @@ def make_baseline_schedule(
                     daysB_before=daysB_before,
                     distB_km_before=distB_before,
                     total_km_before=total_before,
-                    daysA_after=daysA_after,
-                    daysB_after=daysB_after,
+                    daysA_after=None,
+                    daysB_after=None,
                     distB_km_after=distB_after,
                     total_km_after=total_after,
                     overdueA=None,
@@ -397,11 +394,13 @@ def make_baseline_schedule(
                 )
             )
 
-            # 状態更新（当日運用終了後の値を保存）
+            # 状態更新（検査成立→リセット→距離加算済み）
             state[formation_id].loc = op_end_loc
             state[formation_id].prev_op_id = op_id
-            state[formation_id].daysA = daysA_after
-            state[formation_id].daysB = daysB_after
+            if did_inspection_A:
+                state[formation_id].daysA = 0
+            if did_inspection_B:
+                state[formation_id].daysB = 0
             state[formation_id].distB_km = distB_after
             state[formation_id].total_km = total_after
             if formation_id in available:
@@ -452,75 +451,7 @@ def make_baseline_schedule(
         for formation_id, op_row in fixed_items:
             assign_one(formation_id, op_row)
 
-        # 1) 固定運用の次に、start_loc一致を優先して deadhead=0 割当を先に消化
-        req_start_codes = list(req_today["start_loc"].dropna().astype(str).unique())
-        rng.shuffle(req_start_codes)
-        for start_code in req_start_codes:
-            ops_here = req_today[req_today["start_loc"] == start_code].copy()
-            if ops_here.empty:
-                continue
-            ops_list = list(ops_here.itertuples(index=False))
-            rng.shuffle(ops_list)
-            matched_formations = [
-                formation_id
-                for formation_id in available
-                if to_station_code(state[formation_id].loc) == to_station_code(start_code)
-            ]
-            rng.shuffle(matched_formations)
-            for op_row in ops_list:
-                if not matched_formations:
-                    break
-                pick = next(
-                    (
-                        formation_id
-                        for formation_id in matched_formations
-                        if can_assign_distB(formation_id, op_row)
-                    ),
-                    None,
-                )
-                if pick is None:
-                    continue
-                matched_formations.remove(pick)
-                assign_one(pick, op_row)
-
-        # 2) 期限が近い編成を優先し、JB01終着のrequired運用へ寄せる
-        urgent_formations = sorted(
-            available,
-            key=lambda formation_id: (
-                state[formation_id].daysB / max(1, max_days_since_inspectionB),
-                state[formation_id].daysA / max(1, max_days_since_inspectionA),
-                state[formation_id].distB_km / max(1, max_distance_since_inspectionB),
-            ),
-            reverse=True,
-        )
-        mitaka_end_ops = req_today[req_today["end_loc"] == "JB01"].copy()
-        if not mitaka_end_ops.empty and urgent_formations:
-            mitaka_list = list(mitaka_end_ops.itertuples(index=False))
-            rng.shuffle(mitaka_list)
-            for formation_id in list(urgent_formations):
-                if formation_id not in available:
-                    continue
-                if not mitaka_list:
-                    break
-                # deadheadを壊しにくいように start_loc一致候補を優先
-                preferred = [
-                    op_row
-                    for op_row in mitaka_list
-                    if to_station_code(op_row.start_loc)
-                    == to_station_code(state[formation_id].loc)
-                ]
-                fallback = [op_row for op_row in mitaka_list if op_row not in preferred]
-                ordered_ops = preferred + fallback
-                chosen = next(
-                    (op_row for op_row in ordered_ops if can_assign_distB(formation_id, op_row)),
-                    None,
-                )
-                if chosen is None:
-                    continue
-                mitaka_list.remove(chosen)
-                assign_one(formation_id, chosen)
-
-        # 3) 期限逼迫編成を対象にB検査運用を割当（上記で確保できなかった分のフォールバック）
+        # 1) 検査Bの割当（distBが上限に近い編成を優先）
         b_ops = ops[ops["is_inspection_B"] == 1].copy()
         if not b_ops.empty:
             b_ops = b_ops[
@@ -528,24 +459,36 @@ def make_baseline_schedule(
             ]
 
         eligible_formations = [
-            formation_id for formation_id in available if state[formation_id].daysB >= 20
-        ]
+            formation_id
+            for formation_id in available
+            if state[formation_id].daysB >= 20
+        ]  # B検査から20日以上経過した編成をリストアップ
+
         if not b_ops.empty and eligible_formations:
             model = cp_model.CpModel()
             b_op_ids = list(b_ops["operation_id"].astype(str))
             y: Dict[Tuple[str, str], cp_model.IntVar] = {}
             for formation_id in eligible_formations:
                 for op_id in b_op_ids:
-                    y[(formation_id, op_id)] = model.NewBoolVar(f"y_{formation_id}_{op_id}")
+                    y[(formation_id, op_id)] = model.NewBoolVar(
+                        f"y_{formation_id}_{op_id}"
+                    )  # formation_id を、B検査運用 op_id に割り当てるなら 1、割り当てないなら 0
 
             for formation_id in eligible_formations:
-                model.Add(sum(y[(formation_id, op_id)] for op_id in b_op_ids) <= 1)
+                model.Add(
+                    sum(y[(formation_id, op_id)] for op_id in b_op_ids) <= 1
+                )  # 同じ編成が複数のB運用に同時に入るのはダメ
+
             for op_id in b_op_ids:
                 model.Add(
-                    sum(y[(formation_id, op_id)] for formation_id in eligible_formations)
+                    sum(
+                        y[(formation_id, op_id)] for formation_id in eligible_formations
+                    )
                     <= 1
-                )
+                )  # 同じB運用枠に複数編成を突っ込むのはダメ
 
+            # distB/日数が大きい編成ほど優先（期限・距離の逼迫を優先）
+            # 併せて start_loc が一致する割当を優先し、deadhead を減らす。
             model.Maximize(
                 sum(
                     y[(formation_id, op_id)]
@@ -566,20 +509,54 @@ def make_baseline_schedule(
             solver = cp_model.CpSolver()
             status = solver.Solve(model)
             if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                assignments = []
                 for formation_id in eligible_formations:
-                    if formation_id not in available:
-                        continue
                     for op_id in b_op_ids:
                         if solver.Value(y[(formation_id, op_id)]) == 1:
-                            op_row = op_by_id.get(op_id)
-                            if op_row is None:
-                                raise ValueError(
-                                    f"[{day}] 検査Bの対象運用がmaster_dataに存在しない: {op_id}"
-                                )
-                            assign_one(formation_id, op_row)
-                            break
+                            assignments.append((formation_id, op_id))
+                            # 確定した組み合わせに割り当て
+                for formation_id, op_id in assignments:
+                    op_row = op_by_id.get(op_id)
+                    if op_row is None:
+                        raise ValueError(
+                            f"[{day}] 検査Bの対象運用がmaster_dataに存在しない: {op_id}"
+                        )
+                    assign_one(formation_id, op_row)
 
-        # 4) 残り required を CP-SAT で割当（距離偏り最小＋deadhead抑制＋期限超過抑制）
+        # 2) 検査Aの優先割当（daysA_beforeが7→6の順で、指定駅始発へ寄せる）
+        def assign_a_priority(target_days: int) -> None:
+            candidates = [
+                formation_id
+                for formation_id in available
+                if state[formation_id].daysA == target_days
+            ]
+            if not candidates:
+                return
+            rng.shuffle(candidates)
+            for start_code in inspection_a_start_codes:
+                ops_here = req_today[req_today["start_loc"] == start_code].copy()
+                if ops_here.empty:
+                    continue
+                ops_here_list = list(ops_here.itertuples(index=False))
+                rng.shuffle(ops_here_list)
+                for op_row in ops_here_list:
+                    if not candidates:
+                        return
+                    loc_matched = [
+                        fid for fid in candidates if state[fid].loc == start_code
+                    ]
+                    ordered = loc_matched + [fid for fid in candidates if fid not in loc_matched]
+                    pick = next(
+                        (fid for fid in ordered if can_assign_distB(fid, op_row)), None
+                    )
+                    if pick is None:
+                        continue
+                    candidates.remove(pick)
+                    assign_one(pick, op_row)
+
+        assign_a_priority(7)
+        assign_a_priority(6)
+        # 3) 残り required を CP-SAT で割当（距離偏り最小＋deadhead抑制＋期限超過抑制）
         if len(req_today) > 0 and available:
             model = cp_model.CpModel()
             req_list = list(req_today.itertuples(index=False))
@@ -601,8 +578,8 @@ def make_baseline_schedule(
                 daysB_before = f_state.daysB
                 distB_before = f_state.distB_km
 
-                overdueA_idle = int(daysA_before >= max_days_since_inspectionA + 1)
-                overdueB_idle = int(daysB_before >= max_days_since_inspectionB + 1)
+                overdueA_idle = int(daysA_before + 1 >= max_days_since_inspectionA + 1)
+                overdueB_idle = int(daysB_before + 1 >= max_days_since_inspectionB + 1)
 
                 for op in req_list:
                     op_id = str(op.operation_id)
@@ -629,8 +606,8 @@ def make_baseline_schedule(
                         daysA_before in (6, 7)
                         and start_loc in inspection_a_start_codes
                     )
-                    daysA_after = 0 if did_inspection_A else daysA_before + 1
-                    daysB_after = 0 if did_inspection_B else daysB_before + 1
+                    daysA_after = (0 if did_inspection_A else daysA_before) + 1
+                    daysB_after = (0 if did_inspection_B else daysB_before) + 1
                     overdueA_after = int(
                         daysA_after >= max_days_since_inspectionA + 1
                     )
@@ -759,12 +736,22 @@ def make_baseline_schedule(
                 remove_required=False,
             )
 
+        # 日末更新：検査成立済み状態に対して日数+1し、運用終了後の値を記録
+        for formation_id in formation_ids:
+            state[formation_id].daysA += 1
+            state[formation_id].daysB += 1
+
         for row in rows[day_row_start:]:
+            fid = row["formation_id"]
+            row["daysA_after"] = state[fid].daysA
+            row["daysB_after"] = state[fid].daysB
+            row["distB_km_after"] = state[fid].distB_km
+            row["total_km_after"] = state[fid].total_km
             row["overdueA"] = int(
-                row["daysA_after"] >= max_days_since_inspectionA + 1
+                state[fid].daysA >= max_days_since_inspectionA + 1
             )
             row["overdueB"] = int(
-                row["daysB_after"] >= max_days_since_inspectionB + 1
+                state[fid].daysB >= max_days_since_inspectionB + 1
             )
 
     schedule = (
@@ -925,8 +912,8 @@ def add_formation_triplet_sheet(
     col = 2
     for formation_id in formations:
         ws.cell(1, col, formation_id)
-        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
-        col += 3
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 3)
+        col += 4
 
     # Row2: start/end/operation
     ws.cell(2, 1, None)
