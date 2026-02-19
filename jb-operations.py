@@ -305,7 +305,9 @@ def make_baseline_schedule(
         # required運用の未割当リスト（その日ごとに消し込む）
         req_today = required_ops.copy()
 
-        def compute_deadhead(prev_loc: Any, start_loc: Any, prev_op: Any, op_id: str) -> int:
+        def compute_deadhead(
+            prev_loc: Any, start_loc: Any, prev_op: Any, op_id: str
+        ) -> int:
             # 基本：前日の終点 != 当日の始点 なら回送
             deadhead = int(prev_loc != start_loc)
 
@@ -361,12 +363,6 @@ def make_baseline_schedule(
                 distB_after = 0
             else:
                 distB_after = distB_before + distance_km
-            if distB_after > max_distance_since_inspectionB:
-                raise ValueError(
-                    f"[{day}] distB超過: formation={formation_id}, op={op_id}, "
-                    f"distB_before={distB_before}, distance_km={distance_km}, "
-                    f"distB_after={distB_after}, limit={max_distance_since_inspectionB}"
-                )
             total_after = total_before + distance_km
 
             rows.append(
@@ -523,39 +519,6 @@ def make_baseline_schedule(
                         )
                     assign_one(formation_id, op_row)
 
-        # 2) 検査Aの優先割当（daysA_beforeが7→6の順で、指定駅始発へ寄せる）
-        def assign_a_priority(target_days: int) -> None:
-            candidates = [
-                formation_id
-                for formation_id in available
-                if state[formation_id].daysA == target_days
-            ]
-            if not candidates:
-                return
-            rng.shuffle(candidates)
-            for start_code in inspection_a_start_codes:
-                ops_here = req_today[req_today["start_loc"] == start_code].copy()
-                if ops_here.empty:
-                    continue
-                ops_here_list = list(ops_here.itertuples(index=False))
-                rng.shuffle(ops_here_list)
-                for op_row in ops_here_list:
-                    if not candidates:
-                        return
-                    loc_matched = [
-                        fid for fid in candidates if state[fid].loc == start_code
-                    ]
-                    ordered = loc_matched + [fid for fid in candidates if fid not in loc_matched]
-                    pick = next(
-                        (fid for fid in ordered if can_assign_distB(fid, op_row)), None
-                    )
-                    if pick is None:
-                        continue
-                    candidates.remove(pick)
-                    assign_one(pick, op_row)
-
-        assign_a_priority(7)
-        assign_a_priority(6)
         # 3) 残り required を CP-SAT で割当（距離偏り最小＋deadhead抑制＋期限超過抑制）
         if len(req_today) > 0 and available:
             model = cp_model.CpModel()
@@ -587,9 +550,7 @@ def make_baseline_schedule(
                     distance_km = int(op.distance_km)
                     is_inspection_B = int(op.is_inspection_B)
 
-                    did_inspection_B = int(
-                        daysB_before >= 20 and is_inspection_B == 1
-                    )
+                    did_inspection_B = int(daysB_before >= 20 and is_inspection_B == 1)
                     if did_inspection_B:
                         distB_after = 0
                     else:
@@ -603,17 +564,12 @@ def make_baseline_schedule(
                     distance_map[(formation_id, op_id)] = distance_km
 
                     did_inspection_A = int(
-                        daysA_before in (6, 7)
-                        and start_loc in inspection_a_start_codes
+                        daysA_before in (6, 7) and start_loc in inspection_a_start_codes
                     )
-                    daysA_after = (0 if did_inspection_A else daysA_before) + 1
-                    daysB_after = (0 if did_inspection_B else daysB_before) + 1
-                    overdueA_after = int(
-                        daysA_after >= max_days_since_inspectionA + 1
-                    )
-                    overdueB_after = int(
-                        daysB_after >= max_days_since_inspectionB + 1
-                    )
+                    daysA_after = 0 if did_inspection_A else daysA_before + 1
+                    daysB_after = 0 if did_inspection_B else daysB_before + 1
+                    overdueA_after = int(daysA_after >= max_days_since_inspectionA + 1)
+                    overdueB_after = int(daysB_after >= max_days_since_inspectionB + 1)
                     overdue_cost[(formation_id, op_id)] = (
                         overdueA_idle
                         + overdueB_idle
@@ -651,7 +607,9 @@ def make_baseline_schedule(
                 f_state = state[formation_id]
                 total_before = f_state.total_km
                 total_after = model.NewIntVar(
-                    total_before, total_before + max_distance_today, f"total_{formation_id}"
+                    total_before,
+                    total_before + max_distance_today,
+                    f"total_{formation_id}",
                 )
                 model.Add(
                     total_after
@@ -747,16 +705,32 @@ def make_baseline_schedule(
             row["daysB_after"] = state[fid].daysB
             row["distB_km_after"] = state[fid].distB_km
             row["total_km_after"] = state[fid].total_km
-            row["overdueA"] = int(
-                state[fid].daysA >= max_days_since_inspectionA + 1
-            )
-            row["overdueB"] = int(
-                state[fid].daysB >= max_days_since_inspectionB + 1
-            )
+            row["overdueA"] = int(state[fid].daysA >= max_days_since_inspectionA + 1)
+            row["overdueB"] = int(state[fid].daysB >= max_days_since_inspectionB + 1)
 
     schedule = (
         pd.DataFrame(rows).sort_values(["day", "formation_id"]).reset_index(drop=True)
     )
+
+    schedule = schedule.rename(
+        columns={
+            "daysA_after": "daysA",
+            "daysB_after": "daysB",
+            "distB_km_after": "distB_km",
+            "total_km_after": "total_km",
+        }
+    )
+    drop_cols = [
+        "daysA_before",
+        "daysB_before",
+        "distB_km_before",
+        "total_km_before",
+        "daysA_after",
+        "daysB_after",
+        "distB_km_after",
+        "total_km_after",
+    ]
+    schedule = schedule.drop(columns=[c for c in drop_cols if c in schedule.columns])
 
     # ガント風：編成×日 の行列
     gantt_ops = schedule.pivot(
@@ -912,8 +886,8 @@ def add_formation_triplet_sheet(
     col = 2
     for formation_id in formations:
         ws.cell(1, col, formation_id)
-        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 3)
-        col += 4
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
+        col += 3
 
     # Row2: start/end/operation
     ws.cell(2, 1, None)
@@ -1070,9 +1044,9 @@ def add_inspection_triplet_sheet(
     col = 2
     for _ in formations:
         ws.cell(2, col, "operation")
-        ws.cell(2, col + 1, "daysA_after")
-        ws.cell(2, col + 2, "daysB_after")
-        ws.cell(2, col + 3, "distB_km_after")
+        ws.cell(2, col + 1, "daysA")
+        ws.cell(2, col + 2, "daysB")
+        ws.cell(2, col + 3, "distB_km")
         col += 4
 
     header_fill = PatternFill("solid", fgColor="1F4E79")
@@ -1091,13 +1065,15 @@ def add_inspection_triplet_sheet(
         index="day", columns="formation_id", values="operation_id"
     ).reindex(index=days, columns=formations)
     p_daysA = schedule_copy.pivot(
-        index="day", columns="formation_id", values="daysA_after"
+        index="day", columns="formation_id", values="daysA"
     ).reindex(index=days, columns=formations)
+
     p_daysB = schedule_copy.pivot(
-        index="day", columns="formation_id", values="daysB_after"
+        index="day", columns="formation_id", values="daysB"
     ).reindex(index=days, columns=formations)
+
     p_distB = schedule_copy.pivot(
-        index="day", columns="formation_id", values="distB_km_after"
+        index="day", columns="formation_id", values="distB_km"
     ).reindex(index=days, columns=formations)
 
     out_r = 3
@@ -1115,9 +1091,7 @@ def add_inspection_triplet_sheet(
             c_op = ws.cell(out_r, col, (None if pd.isna(ov) else str(ov)))
             c_a = ws.cell(out_r, col + 1, (None if pd.isna(av) else int(av)))
             c_b = ws.cell(out_r, col + 2, (None if pd.isna(bv) else int(bv)))
-            c_d = ws.cell(
-                out_r, col + 3, (None if pd.isna(dv) else int(dv))
-            )
+            c_d = ws.cell(out_r, col + 3, (None if pd.isna(dv) else int(dv)))
 
             for cell in (c_op, c_a, c_b, c_d):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
